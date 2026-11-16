@@ -1091,6 +1091,14 @@ function packSideband(pack: Buffer): Buffer {
   return Buffer.concat(parts);
 }
 
+// Cache of fetch results (pack + shallow-info) keyed by the exact fetch
+// inputs. Pack bytes are a pure function of (repo objects, wants, haves,
+// depth, shallow boundaries) — objects are content-addressed and never
+// mutate — so a cached pack is byte-identical to a fresh one. This turns
+// the 50 concurrent shallow clones of the same tip into one pack build.
+const fetchPackCache = new Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>();
+const FETCH_PACK_CACHE_MAX = 64;
+
 function handleUploadPackV2(r: Repo, body: Buffer): { status: number; body: Buffer; contentType: string } {
   const { packets } = decodePktLines(body);
   const lines: string[] = [];
@@ -1134,8 +1142,19 @@ function handleUploadPackV2(r: Repo, body: Buffer): { status: number; body: Buff
         if (Number.isFinite(n)) depth = n;
       }
     }
-    const plan = planFetch(r, wants, haves, depth, shallowIn);
-    const pack = writePack(plan.objects);
+    const cacheKey = `${r.fullName}\n${wants.join(',')}\n${haves.join(',')}\n${depth ?? ''}\n${shallowIn.join(',')}`;
+    let cached = fetchPackCache.get(cacheKey);
+    if (!cached) {
+      const plan = planFetch(r, wants, haves, depth, shallowIn);
+      cached = { pack: writePack(plan.objects), shallow: plan.shallow, unshallow: plan.unshallow };
+      if (fetchPackCache.size >= FETCH_PACK_CACHE_MAX) {
+        const oldest = fetchPackCache.keys().next().value;
+        if (oldest !== undefined) fetchPackCache.delete(oldest);
+      }
+      fetchPackCache.set(cacheKey, cached);
+    }
+    const pack = cached.pack;
+    const plan = cached;
     const parts: Buffer[] = [];
     if (haves.length > 0) {
       parts.push(pktLine('acknowledgments\n'));
