@@ -994,6 +994,31 @@ function planFetch(r: Repo, wants: string[], haves: string[], depth: number | nu
       if (!haveReachable.has(oid)) wanted.add(oid);
     }
   } else {
+    // A shallow client's haves are shallow boundaries: it holds each have
+    // commit plus its tree closure, but NOT the have's parents. Compute that
+    // held set explicitly instead of reusing the parent-following closure.
+    const held = new Set<string>();
+    const holdStack: string[] = [...haves, ...shallowBoundaries];
+    while (holdStack.length) {
+      const cur = holdStack.pop()!;
+      if (held.has(cur)) continue;
+      const o = r.objects.get(cur);
+      if (!o) continue;
+      held.add(cur);
+      if (o.type === 'commit') {
+        holdStack.push(parseCommit(o.data).tree);
+      } else if (o.type === 'tree') {
+        for (const e of parseTree(o.data)) {
+          if (e.mode !== '160000') holdStack.push(e.oid);
+        }
+      } else if (o.type === 'tag') {
+        const blank = o.data.indexOf('\n\n');
+        const head = (blank < 0 ? o.data : o.data.subarray(0, blank)).toString('utf8');
+        for (const line of head.split('\n')) {
+          if (line.startsWith('object ')) holdStack.push(line.slice(7));
+        }
+      }
+    }
     // BFS over commits by generation; objects of commits within depth.
     const commitGen = new Map<string, number>();
     const queue: Array<{ oid: string; gen: number }> = wants.filter((w) => isOid(w)).map((w) => ({ oid: w, gen: 1 }));
@@ -1015,7 +1040,7 @@ function planFetch(r: Repo, wants: string[], haves: string[], depth: number | nu
     // Shared blobs stay: a blob is wanted when the in-depth tree names it,
     // even if a deeper commit's tree names it too.
     for (const oid of commitGen.keys()) {
-      if (haveReachable.has(oid)) continue;
+      if (held.has(oid)) continue;
       wanted.add(oid);
       const obj = r.objects.get(oid);
       if (!obj || obj.type !== 'commit') continue;
@@ -1023,7 +1048,7 @@ function planFetch(r: Repo, wants: string[], haves: string[], depth: number | nu
       const stack: string[] = [tree];
       while (stack.length) {
         const cur = stack.pop()!;
-        if (wanted.has(cur) || haveReachable.has(cur)) continue;
+        if (wanted.has(cur) || held.has(cur)) continue;
         const o = r.objects.get(cur);
         if (!o) continue;
         wanted.add(cur);
@@ -2203,7 +2228,9 @@ class GqlParser {
     if (this.peek() === '(') {
       this.next();
       while (this.peek() !== ')') {
-        const varName = this.next();
+        let varName = this.next();
+        if (varName === '$') varName = this.next();
+        varName = varName.replace(/^\$/, '');
         this.expect(':');
         this.parseType();
         let defaultValue: GqlValue | null = null;
@@ -2761,18 +2788,20 @@ function resolveGqlField(typeName: string, obj: Record<string, unknown>, field: 
       const first = typeof args.first === 'number' ? args.first : 30;
       const r = obj._repo as Repo | undefined;
       const pull = obj._pull as Pull | undefined;
-      let files: Array<{ path: string }> = (obj._files ?? []) as Array<{ path: string }>;
+      let files: Array<{ filename: string }> = (obj._files ?? []) as Array<{ filename: string }>;
       if ((!files || files.length === 0) && r && pull) {
         const headTip = r.tip(`refs/heads/${pull.headRef}`);
         const baseTip = r.tip(`refs/heads/${pull.baseRef}`);
         if (headTip && baseTip) {
-          const base = mergeBase(r, headTip, baseTip);
-          files = diffTrees(r, base ? treeOidAt(r, base) : EMPTY_TREE_OID, treeOidAt(r, headTip));
+          const base = r.mergeBase(headTip, baseTip);
+          const baseTree = base ? parseCommit(r.objects.get(base)!.data).tree : null;
+          const headTree = parseCommit(r.objects.get(headTip)!.data).tree;
+          files = diffTrees(r, baseTree, headTree);
         }
       }
       return {
         __typename: 'PullRequestChangedFileConnection',
-        nodes: files.slice(0, first).map((f) => ({ __typename: 'PullRequestChangedFile', path: f.path })),
+        nodes: files.slice(0, first).map((f) => ({ __typename: 'PullRequestChangedFile', path: f.filename })),
       };
     }
     return obj[name] ?? null;
